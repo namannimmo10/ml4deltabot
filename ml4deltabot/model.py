@@ -33,6 +33,29 @@ def build_gru(window_size, n_channels, gru_units, dense_units, n_outputs=3):
     return keras.Model(inp, out, name="DeltabotGRU")
 
 
+def build_controller_mlp(input_dim, hidden_units, n_outputs=3, activation="relu",
+                         zero_init_output=False):
+    """
+    Input(input_dim) -> [Dense(activation)]xN -> Dense(n_outputs, linear).
+    Plain feedforward, no recurrence: the plant carries the temporal state,
+    the controller only sees a handful of per-step scalars.
+    zero_init_output=True makes the untrained network output exactly 0, which
+    (with an incremental voltage output) means "keep the previous voltage".
+    """
+    inp = keras.Input(shape=(input_dim,), name="controller_features")
+
+    x = inp
+    for i, units in enumerate(hidden_units):
+        x = keras.layers.Dense(units, activation=activation, name=f"dense_{i}")(x)
+
+    out = keras.layers.Dense(
+        n_outputs, activation="linear", name="voltage_demand", dtype="float32",
+        kernel_initializer="zeros" if zero_init_output else "glorot_uniform",
+    )(x)
+
+    return keras.Model(inp, out, name="DeltabotController")
+
+
 _GROUP_BY_PREFIX = {
     "x_out": "position", "y_out": "position", "z_out": "position",
     "vx": "velocity", "vy": "velocity", "vz": "velocity",
@@ -42,8 +65,11 @@ _GROUP_BY_PREFIX = {
 
 def make_group_mae_metrics(y_std, target_names):
     """
-    One MAE metric per target group (position/velocity), each in its
-    own physical units.
+    One MAE metric per target group (position/velocity/voltage), each in its
+    own physical units. Averaging error across groups in one metric is
+    misleading when their scales differ hugely (e.g. velocity's y_std can be
+    ~50x position's) — the larger-scale group would dominate a blended mean
+    even if the smaller-scale group is predicted well.
     """
     y_std_t = tf.constant(y_std, dtype=tf.float32)
 

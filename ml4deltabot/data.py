@@ -12,24 +12,31 @@ def find_files(data_dir):
         raise FileNotFoundError(f"No .txt files in {data_dir!r}")
     return paths
 
+TARGET_COLUMNS = dict(
+    position=(["x_out", "y_out", "z_out"], slice(3, 6)),
+    voltage=(["x_in", "y_in", "z_in"], slice(0, 3)),
+)
 
-def load_file(path):
-    """Load one txt file -> (N, 6) float32 array: [x_in,y_in,z_in,x_out,y_out,z_out]."""
+
+def load_file(path, offset=None):
+    """
+    Load one txt file -> (N, 6) float32 array: [x_in,y_in,z_in,x_out,y_out,z_out].
+    offset: optional length-6 array subtracted in float64 BEFORE the float32 cast.
+    z sits near -4.8e7 nm where float32 only resolves 4 nm, so subtracting a
+    reference first keeps sub-nm resolution.
+    """
     data = np.fromfile(path, sep=" ", dtype=np.float64).reshape(-1, 10)
-    return np.stack([
+    cols = np.stack([
         data[:, cfg.COL["x_in"]],
         data[:, cfg.COL["y_in"]],
         data[:, cfg.COL["z_in"]],
         data[:, cfg.COL["x_out"]],
         data[:, cfg.COL["y_out"]],
         data[:, cfg.COL["z_out"]],
-    ], axis=1).astype(np.float32)
-
-
-TARGET_COLUMNS = dict(
-    position=(["x_out", "y_out", "z_out"], slice(3, 6)),
-    voltage=(["x_in", "y_in", "z_in"], slice(0, 3)),
-)
+    ], axis=1)
+    if offset is not None:
+        cols = cols - np.asarray(offset, dtype=np.float64)
+    return cols.astype(np.float32)
 
 
 def build_sequences(data, window_size, dt=cfg.DT, targets=cfg.TARGETS):
@@ -75,6 +82,47 @@ def load_all_files(paths, label, window_size=cfg.WINDOW_SIZE):
     print(f"  {'Total ' + label:40s}  {len(X_all):>8,} seqs  "
           f"X={X_all.shape}  Y={Y_all.shape}  targets={target_names}")
     return X_all, Y_all, target_names
+
+
+def build_controller_features(data, dt=cfg.DT):
+    """
+    Compact per-step features for the controller (inverse) model — no
+    windowing, so it stays a plain MLP rather than needing its own
+    recurrence on top of the plant's GRU.
+
+    X: [current_pos(3), current_vel(3), prev_voltage(3), desired_next_pos(3)] -> (N-2, 12)
+    Y: voltage actually applied to reach desired_next_pos -> (N-2, 3)
+
+    Needs 2 prior rows to form current_vel, so starts at index 2.
+    """
+    pos = data[:, 3:6]
+    volt = data[:, 0:3]
+
+    current_pos = pos[1:-1]
+    current_vel = (pos[1:-1] - pos[0:-2]) / dt
+    prev_voltage = volt[1:-1]
+    desired_next_pos = pos[2:]
+    Y = volt[2:]
+
+    X = np.concatenate([current_pos, current_vel, prev_voltage, desired_next_pos], axis=1)
+    names = ["cur_x", "cur_y", "cur_z", "vel_x", "vel_y", "vel_z",
+             "prev_vx", "prev_vy", "prev_vz", "des_x", "des_y", "des_z"]
+    return X.astype(np.float32), Y.astype(np.float32), names
+
+
+def load_all_controller_files(paths, label, dt=cfg.DT):
+    X_list, Y_list = [], []
+    names = None
+    for p in paths:
+        X, Y, names = build_controller_features(load_file(p), dt=dt)
+        X_list.append(X)
+        Y_list.append(Y)
+        print(f"  {os.path.basename(p):40s}  {len(X):>8,} seqs")
+    X_all = np.vstack(X_list)
+    Y_all = np.vstack(Y_list)
+    print(f"  {'Total ' + label:40s}  {len(X_all):>8,} seqs  "
+          f"X={X_all.shape}  Y={Y_all.shape}  features={names}")
+    return X_all, Y_all, names
 
 
 def split_files(data_dir, train_ratio, seed):
