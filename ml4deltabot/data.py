@@ -6,7 +6,17 @@ import numpy as np
 from . import config as cfg
 
 
+def is_campaign_dir(data_dir):
+    """A campaign root holds timestamped run directories of .h5 captures."""
+    return bool(glob.glob(os.path.join(data_dir, "*", "*", "*.h5")))
+
+
 def find_files(data_dir):
+    if is_campaign_dir(data_dir):
+        from .campaign_data import find_campaign_files
+        return [p for r in sorted(glob.glob(os.path.join(data_dir, "*")))
+                if os.path.isdir(r) and not os.path.islink(r)
+                for p in find_campaign_files(r)]
     paths = sorted(glob.glob(os.path.join(data_dir, "*_all_axis_*.txt")))
     if not paths:
         raise FileNotFoundError(f"No .txt files in {data_dir!r}")
@@ -20,11 +30,24 @@ TARGET_COLUMNS = dict(
 
 def load_file(path, offset=None):
     """
-    Load one txt file -> (N, 6) float32 array: [x_in,y_in,z_in,x_out,y_out,z_out].
+    Load one capture -> (N, 6) float32 array: [x_in,y_in,z_in,x_out,y_out,z_out].
+
+    Dispatches on extension: .h5 goes to the campaign loader (HDF5, 40 kHz,
+    anti-alias decimated to 1/cfg.DT), anything else is the old 10-column
+    whitespace .txt format.
+
     offset: optional length-6 array subtracted in float64 BEFORE the float32 cast.
     z sits near -4.8e7 nm where float32 only resolves 4 nm, so subtracting a
     reference first keeps sub-nm resolution.
     """
+    if path.endswith(".h5"):
+        from .campaign_data import load_campaign_file
+        data = load_campaign_file(path, offset=offset)
+        if data is None:
+            raise ValueError(f"{path} is not an open-loop capture; "
+                             "it should have been filtered out by find_files")
+        return data
+
     data = np.fromfile(path, sep=" ", dtype=np.float64).reshape(-1, 10)
     cols = np.stack([
         data[:, cfg.COL["x_in"]],
@@ -126,6 +149,18 @@ def load_all_controller_files(paths, label, dt=cfg.DT):
 
 
 def split_files(data_dir, train_ratio, seed):
+    """
+    Campaign data splits by RUN: the two October runs are independent repeats
+    an hour apart, so holding one out measures session generalisation. A
+    random file shuffle would put the same excitation, recorded twice, on
+    both sides of the split and flatter the model.
+
+    The old .txt data has no such structure, so it keeps the random split.
+    """
+    if is_campaign_dir(data_dir):
+        from .campaign_data import split_campaign_runs
+        return split_campaign_runs(data_dir)
+
     paths = find_files(data_dir)
     rng = np.random.default_rng(seed)
     paths = list(rng.permutation(paths))
